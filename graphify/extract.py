@@ -1685,6 +1685,74 @@ def _normalize_ts_import_types(source: bytes, *, tsx: bool = False) -> bytes | N
     return bytes(norm) if changed else None
 
 
+# A line that *opens* with `in`/`instanceof` directly followed by `_`, `$` or a digit
+# (`in_stock`, `instanceof_check`, `in$cart`, `in42`) -- a valid identifier the pinned
+# JS/TS grammars' automatic-semicolon scanner misreads as the `in`/`instanceof` operator
+# continuing an unterminated previous line. `instanceof` is tried first so an identifier
+# like `instanceof_check` is matched whole rather than stopping at its `in` prefix.
+_IN_PREFIXED_LINE_RE = re.compile(rb"^([ \t]*)(?:instanceof|in)[_$0-9]", re.MULTILINE)
+
+
+def _repair_in_prefixed_lines(source: bytes, config: LanguageConfig) -> bytes | None:
+    """Repair an `in`/`instanceof`-prefixed line the pinned grammar reads as unterminated.
+
+    Measured 2026-09-29: the pinned tree-sitter JS/TS grammars' automatic-semicolon
+    scanner tests ``iswalpha`` right after ``in``, so a line opening with an
+    identifier like ``in_stock`` or ``instanceof_check`` is read as the ``in``/
+    ``instanceof`` operator continuing the previous, unterminated line instead of
+    starting its own member or statement -- breaking the enclosing interface,
+    type literal or class. No grammar release fixes it (#pk2).
+
+    The fix never inserts or moves a byte: one byte of the candidate line's own
+    leading indentation is swapped for a ``;``, which the grammar already accepts
+    as an empty member/statement separator. It is attempted only when the file
+    as given does not parse, is skipped for a line with no indentation to swap,
+    and -- byte-swap applied -- is kept only if the whole file then parses clean.
+    Any file this cannot provably clear is returned untouched, parse errors
+    included, rather than risk a byte-for-byte change that `source_override`
+    cannot take back.
+    """
+    matches = list(_IN_PREFIXED_LINE_RE.finditer(source))
+    if not matches:
+        return None
+
+    try:
+        mod = importlib.import_module(config.ts_module)
+        from tree_sitter import Language, Parser
+
+        lang_fn = getattr(mod, config.ts_language_fn, None) or getattr(mod, "language", None)
+        if lang_fn is None:
+            return None
+        parser = Parser(Language(lang_fn()))
+        original_root = parser.parse(source).root_node
+    except Exception:
+        return None
+
+    if not original_root.has_error:
+        return None
+
+    repaired = bytearray(source)
+    changed = False
+    for match in matches:
+        indent = match.group(1)
+        if not indent:
+            # No indentation byte to swap without moving or inserting a byte;
+            # leave this candidate -- and, by falling through, the whole file
+            # if nothing else matched -- exactly as written.
+            continue
+        repaired[match.start(1) + len(indent) - 1] = 0x3B  # ';'
+        changed = True
+    if not changed:
+        return None
+
+    if parser.parse(bytes(repaired)).root_node.has_error:
+        # The swap didn't clear every error (an unrelated break elsewhere, or a
+        # candidate whose own line still fails some other way): keep the source
+        # exactly as written rather than land a partial, unverified repair.
+        return None
+    return bytes(repaired)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def extract_python(path: Path) -> dict:
@@ -1706,12 +1774,21 @@ def extract_js(path: Path) -> dict:
     else:
         config = _JS_CONFIG
     source_override = None
-    if is_ts:
-        try:
-            source = path.read_bytes()
-            source_override = _normalize_ts_import_types(source, tsx=suffix == ".tsx")
-        except OSError:
-            pass
+    try:
+        source = path.read_bytes()
+    except OSError:
+        source = None
+    if source is not None:
+        working = source
+        if is_ts:
+            normalized = _normalize_ts_import_types(working, tsx=suffix == ".tsx")
+            if normalized is not None:
+                working = normalized
+        repaired = _repair_in_prefixed_lines(working, config)
+        if repaired is not None:
+            working = repaired
+        if working is not source:
+            source_override = working
     result = _extract_generic(path, config, source_override=source_override)
     if "error" not in result:
         _extract_js_rationale(path, result)
